@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "alg": "AES-256-GCM",
+  "kdf": "scrypt",
+  "salt": "nQZvQsvZJWnqf/TZOopVfQ==",
+  "scrypt_params": {
+    "n": 32768,
+    "r": 8,
+    "p": 1
+  },
+  "verifier": {
+    "nonce": "IwhbRKqEr/Oddkiu",
+    "ciphertext": "XyoDTYDRZDAMFVk4IX8SzkQTWPD+MoPuLtArb9+cwfrPQ+A="
+  },
+  "created_at": "2026-11-20T11:34:05+09:00"
+}
