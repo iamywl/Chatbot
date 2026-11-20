@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VaultLLM — Private MLX Encrypted Chat</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Markdown, Sanitizer, Code Highlighting, Math (CDN with graceful offline fallback) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark-dimmed.min.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@14.1.2/marked.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/common.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Control Bar -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <button id="btn-toggle-sidebar" class="icon-btn" title="사이드바 토글" aria-label="사이드바 토글">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="18" height="18" rx="3"/><line x1="9" y1="3" x2="9" y2="21"/>
+          </svg>
+        </button>
+        <div class="brand">
+          <span class="brand-icon">🔐</span>
+          <span class="brand-name">VaultLLM</span>
+          <span class="brand-tag">MLX</span>
+        </div>
+      </div>
+
+      <div class="topbar-center">
+        <!-- Model Lifecycle Control -->
+        <div class="control-pill model-pill" id="model-pill">
+          <span class="status-dot" id="model-status-dot"></span>
+          <div class="pill-text">
+            <span class="pill-title" id="model-name-label">gpt-oss-120b</span>
+            <span class="pill-sub" id="model-status-label">Unloaded</span>
+          </div>
+          <button id="btn-model-toggle" class="btn btn-sm btn-primary">Load</button>
+          <button id="btn-model-console" class="icon-btn btn-xs" title="모델 콘솔 & 자동 언로드 설정">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- Unified Memory Gauge -->
+        <div class="control-pill ram-pill" id="ram-pill" title="Apple Silicon 통합 메모리 사용량">
+          <div class="ram-info">
+            <span class="ram-label">RAM <strong id="ram-used-text">--</strong> / <span id="ram-total-text">128</span> GB</span>
+            <span class="ram-sub" id="ram-mlx-text">MLX 0 GB</span>
+          </div>
+          <div class="ram-bar">
+            <div class="ram-bar-fill" id="ram-bar-fill" style="width: 0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <!-- Git Sync Pill -->
+        <div class="control-pill git-pill">
+          <button id="btn-git-details" class="git-status-btn" title="Git 암호화 동기화 상세">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/>
+            </svg>
+            <span id="git-status-text">Git</span>
+          </button>
+          <button id="btn-git-push" class="btn btn-xs btn-ghost" title="암호화 커밋 & Push">Push</button>
+          <button id="btn-git-pull" class="btn btn-xs btn-ghost" title="원격 Pull">Pull</button>
+        </div>
+
+        <!-- Vault Security Controls -->
+        <div class="control-pill vault-pill">
+          <button id="btn-vault-settings" class="btn btn-xs btn-ghost" title="키 백업 & 자동 잠금 설정">
+            🔑 키 관리
+          </button>
+          <button id="btn-vault-lock" class="btn btn-xs btn-danger-ghost" title="Vault 즉시 잠금 (메모리에서 키 파기)">
+            🔒 잠금
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <!-- Workspace Body -->
+    <div class="workspace">
+      <!-- Sidebar -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-top">
+          <button id="btn-new-session" class="btn btn-primary btn-block">
+            <span>＋</span> 새 채팅 세션
+          </button>
+          <div class="search-box">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input id="session-search" type="search" placeholder="복호화된 대화 검색..." autocomplete="off" />
+          </div>
+          <div class="persona-filter" id="persona-filter"></div>
+        </div>
+
+        <div class="session-list" id="session-list">
+          <div class="empty-hint">세션이 없습니다</div>
+        </div>
+
+        <div class="sidebar-footer">
+          <button id="btn-open-personas" class="btn btn-ghost btn-sm btn-block">
+            🎭 페르소나(프롬프트) 관리
+          </button>
+          <div class="vault-badge-footer">
+            <span>AES-256-GCM</span>
+            <span id="sidebar-enc-count">0개 암호화됨</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main Chat Area -->
+      <main class="chat-main">
+        <!-- Session Toolbar -->
+        <div class="session-bar" id="session-bar">
+          <div class="session-bar-left">
+            <input id="session-title-input" class="session-title-input" type="text" value="새 대화" placeholder="세션 제목..." />
+            <select id="session-persona-select" class="select-compact" title="페르소나 선택"></select>
+          </div>
+          <div class="session-bar-right">
+            <div class="segmented" id="reasoning-effort-group" title="gpt-oss-120b 추론 강도">
+              <button data-effort="low" class="seg-btn">Low</button>
+              <button data-effort="medium" class="seg-btn active">Med</button>
+              <button data-effort="high" class="seg-btn">High</button>
+            </div>
+            <button id="btn-gen-params" class="btn btn-xs btn-ghost" title="생성 파라미터 조정">⚙ 파라미터</button>
+            <button id="btn-export-md" class="btn btn-xs btn-ghost" title="복호화된 Markdown 다운로드">⬇ .md</button>
+          </div>
+        </div>
+
+        <!-- Generation Params Popover -->
+        <div class="params-popover hidden" id="params-popover">
+          <div class="popover-header">
+            <strong>생성 파라미터 (반복 루프 방지 프리셋)</strong>
+            <button id="btn-reset-params" class="btn btn-xs btn-ghost">기본값 복원</button>
+          </div>
+          <div class="param-grid">
+            <label>
+              <span>Temperature <strong id="val-temp">0.6</strong></span>
+              <input id="param-temp" type="range" min="0" max="1.5" step="0.05" value="0.6" />
+            </label>
+            <label>
+              <span>Top-P <strong id="val-top-p">0.95</strong></span>
+              <input id="param-top-p" type="range" min="0.1" max="1.0" step="0.01" value="0.95" />
+            </label>
+            <label>
+              <span>Presence Penalty <strong id="val-presence">0.2</strong></span>
+              <input id="param-presence" type="range" min="0" max="1.5" step="0.05" value="0.2" />
+            </label>
+            <label>
+              <span>Max Tokens <strong id="val-max-tokens">4096</strong></span>
+              <input id="param-max-tokens" type="number" min="256" max="32768" step="256" value="4096" />
+            </label>
+          </div>
+        </div>
+
+        <!-- Messages Stream -->
+        <div class="messages-viewport" id="messages-viewport">
+          <div class="messages-container" id="messages-container"></div>
+        </div>
+
+        <!-- Model Unloaded Inline Notice -->
+        <div class="model-banner hidden" id="model-banner">
+          <span id="model-banner-text">로컬 모델이 메모리에 적재되어 있지 않습니다. 대화를 시작하려면 모델을 올려주세요.</span>
+          <button id="btn-banner-load" class="btn btn-xs btn-primary">지금 메모리 적재 (Load)</button>
+        </div>
+
+        <!-- Composer -->
+        <div class="composer-wrap">
+          <div class="composer">
+            <textarea
+              id="chat-input"
+              rows="1"
+              placeholder="메시지를 입력하세요... (Enter 전송, Shift+Enter 줄바꿈)"
+            ></textarea>
+            <div class="composer-actions">
+              <span class="composer-hint" id="composer-hint">AES-256-GCM 암호화 저장</span>
+              <button id="btn-send" class="btn btn-primary btn-send">전송</button>
+              <button id="btn-stop" class="btn btn-danger btn-send hidden">중단</button>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Vault Lock / Init Overlay Modal -->
+  <div class="modal-overlay hidden" id="vault-modal">
+    <div class="modal-card modal-vault">
+      <div class="vault-hero">
+        <div class="vault-lock-icon">🔐</div>
+        <h2 id="vault-modal-title">Private Vault 잠금 해제</h2>
+        <p id="vault-modal-desc">
+          모든 대화 기록은 AES-256-GCM으로 암호화되어 Git에 저장됩니다.<br />
+          키는 서버 메모리에만 임시 보관되며 디스크나 Git에 절대 기록되지 않습니다.
+        </p>
+        <div class="vault-meta-badge hidden" id="vault-enc-badge"></div>
+      </div>
+
+      <!-- First-time Init Form -->
+      <div id="vault-init-view" class="hidden">
+        <div class="tabs">
+          <button class="tab-btn active" data-init-tab="passphrase">패스프레이즈 설정 (추천)</button>
+          <button class="tab-btn" data-init-tab="keyfile">랜덤 .key 파일 발급</button>
+        </div>
+
+        <div id="init-tab-passphrase" class="tab-panel">
+          <div class="form-group">
+            <label for="init-passphrase">마스터 패스프레이즈 (최소 6자)</label>
+            <input id="init-passphrase" type="password" placeholder="강력한 비밀번호를 입력하세요" autocomplete="new-password" />
+          </div>
+          <div class="form-group">
+            <label for="init-passphrase-confirm">패스프레이즈 확인</label>
+            <input id="init-passphrase-confirm" type="password" placeholder="한 번 더 입력하세요" autocomplete="new-password" />
+          </div>
+          <button id="btn-init-passphrase" class="btn btn-primary btn-block">Vault 생성 및 시작</button>
+        </div>
+
+        <div id="init-tab-keyfile" class="tab-panel hidden">
+          <p class="muted-note">
+            암호학적으로 안전한 256-bit 랜덤 마스터 키를 생성합니다. 생성 직후 <code>.key</code> 파일을 안전한 곳(iCloud Keychain, 1Password 등)에 반드시 보관하세요.
+          </p>
+          <button id="btn-init-keyfile" class="btn btn-primary btn-block">256-bit 랜덤 키 생성 & Vault 시작</button>
+        </div>
+      </div>
+
+      <!-- Unlock Existing Vault Form -->
+      <div id="vault-unlock-view" class="hidden">
+        <div class="tabs">
+          <button class="tab-btn active" id="tab-btn-unlock-pw" data-unlock-tab="passphrase">패스프레이즈</button>
+          <button class="tab-btn" id="tab-btn-unlock-key" data-unlock-tab="keyfile">개인 키 (.key)</button>
+        </div>
+
+        <div id="unlock-tab-passphrase" class="tab-panel">
+          <div class="form-group">
+            <label for="unlock-passphrase">패스프레이즈</label>
+            <input id="unlock-passphrase" type="password" placeholder="Vault 패스프레이즈 입력" autocomplete="current-password" />
+          </div>
+          <button id="btn-unlock-passphrase" class="btn btn-primary btn-block">잠금 해제</button>
+        </div>
+
+        <div id="unlock-tab-keyfile" class="tab-panel hidden">
+          <div class="dropzone" id="key-dropzone">
+            <input id="key-file-input" type="file" accept=".key,.txt" hidden />
+            <p>📄 <strong>.key 파일</strong>을 여기에 끌어다 놓거나 클릭해 선택하세요</p>
+          </div>
+          <div class="form-group">
+            <label for="unlock-key-text">또는 키 문자열 직접 붙여넣기</label>
+            <input id="unlock-key-text" type="password" placeholder="CHATBOT-KEY-v1:..." autocomplete="off" />
+          </div>
+          <button id="btn-unlock-key" class="btn btn-primary btn-block">개인 키로 잠금 해제</button>
+        </div>
+
+        <div class="vault-unlock-footer">
+          <button id="btn-vault-pull" class="btn btn-xs btn-ghost">↻ 원격 Git에서 최신 암호화 기록 Pull</button>
+        </div>
+      </div>
+
+      <!-- Post-Init Backup Key View -->
+      <div id="vault-backup-view" class="hidden">
+        <div class="alert-box">
+          <strong>⚠️ 복구용 마스터 키를 지금 백업하세요!</strong>
+          <p>키를 분실하면 암호화된 과거 채팅을 절대 복호화할 수 없습니다.</p>
+        </div>
+        <div class="key-display">
+          <code id="init-backup-key-code"></code>
+        </div>
+        <div class="btn-row">
+          <button id="btn-download-init-key" class="btn btn-primary">⬇ vault.key 다운로드</button>
+          <button id="btn-copy-init-key" class="btn btn-ghost">📋 복사</button>
+          <button id="btn-enter-app" class="btn btn-success">확인 완료 · 시작하기</button>
+        </div>
+      </div>
+
+      <div class="form-error hidden" id="vault-modal-error"></div>
+    </div>
+  </div>
+
+  <!-- Model Console & Settings Modal -->
+  <div class="modal-overlay hidden" id="model-modal">
+    <div class="modal-card modal-lg">
+      <div class="modal-header">
+        <h3>🖥 로컬 MLX 모델 제어 & 콘솔</h3>
+        <button class="icon-btn modal-close" data-close="model-modal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-row">
+          <label>로컬 모델 선택
+            <select id="model-select" class="select-full"></select>
+          </label>
+          <label>미사용 자동 언로드 (Idle Auto-Unload)
+            <select id="idle-unload-select" class="select-full">
+              <option value="0">사용 안 함</option>
+              <option value="15">15분 후 자동 해제</option>
+              <option value="30" selected>30분 후 자동 해제</option>
+              <option value="60">60분 후 자동 해제</option>
+              <option value="120">2시간 후 자동 해제</option>
+            </select>
+          </label>
+        </div>
+        <div class="model-metrics-grid" id="model-metrics-grid"></div>
+        <div class="console-header">
+          <span>mlx_lm.server 실시간 로그</span>
+          <button id="btn-refresh-logs" class="btn btn-xs btn-ghost">새로고침</button>
+        </div>
+        <pre class="console-box" id="model-console-output">로그가 없습니다.</pre>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-modal-load" class="btn btn-primary">메모리에 적재 (Load)</button>
+        <button id="btn-modal-unload" class="btn btn-danger">메모리에서 내리기 (Unload)</button>
+        <button class="btn btn-ghost modal-close" data-close="model-modal">닫기</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Persona Manager Modal -->
+  <div class="modal-overlay hidden" id="persona-modal">
+    <div class="modal-card modal-lg">
+      <div class="modal-header">
+        <h3>🎭 페르소나 시스템 프롬프트 (prompts/*.md)</h3>
+        <button class="icon-btn modal-close" data-close="persona-modal">✕</button>
+      </div>
+      <div class="modal-body persona-layout">
+        <div class="persona-sidebar">
+          <div class="persona-new-row">
+            <input id="new-persona-name" type="text" placeholder="영문/숫자 이름 (예: rust_dev)" />
+            <button id="btn-create-persona" class="btn btn-xs btn-primary">추가</button>
+          </div>
+          <div id="persona-modal-list" class="persona-modal-list"></div>
+        </div>
+        <div class="persona-editor">
+          <div class="persona-editor-head">
+            <strong id="editing-persona-name">default</strong>
+            <button id="btn-delete-persona" class="btn btn-xs btn-danger-ghost">삭제</button>
+          </div>
+          <textarea id="persona-content-input" rows="14" placeholder="시스템 프롬프트를 Markdown으로 작성하세요..."></textarea>
+          <div class="btn-row end">
+            <button id="btn-save-persona" class="btn btn-primary btn-sm">저장 (Git 동기화)</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Key Backup & Vault Settings Modal -->
+  <div class="modal-overlay hidden" id="key-modal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>🔑 개인 암호화 키 관리</h3>
+        <button class="icon-btn modal-close" data-close="key-modal">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="muted-note">
+          이 키를 백업해 두면 다른 기기나 오프라인 CLI(<code>scripts/decrypt.py</code>)에서도 과거 암호화 채팅을 언제든 복호화할 수 있습니다.
+        </p>
+        <div class="form-group">
+          <label>마스터 키 (메모리에서 조회)</label>
+          <div class="key-reveal-row">
+            <input id="backup-key-input" type="password" readonly value="" />
+            <button id="btn-toggle-key-vis" class="btn btn-xs btn-ghost">보기</button>
+            <button id="btn-copy-backup-key" class="btn btn-xs btn-ghost">복사</button>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="btn-download-backup-key" class="btn btn-primary btn-sm">⬇ vault.key 파일 다운로드</button>
+        </div>
+        <hr class="divider" />
+        <div class="form-group">
+          <label for="vault-autolock-select">Vault 미사용 자동 잠금</label>
+          <select id="vault-autolock-select" class="select-full">
+            <option value="0">사용 안 함 (수동 잠금)</option>
+            <option value="15">15분 후 자동 잠금</option>
+            <option value="30">30분 후 자동 잠금</option>
+            <option value="60">60분 후 자동 잠금</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost modal-close" data-close="key-modal">닫기</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Git Sync Details Modal -->
+  <div class="modal-overlay hidden" id="git-modal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>🌿 암호화 Git 동기화 상태</h3>
+        <button class="icon-btn modal-close" data-close="git-modal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="git-modal-info" class="git-info-grid"></div>
+        <div class="form-group toggle-row">
+          <label for="git-autosync-toggle">답변 완료 후 자동 커밋 & Push (10초 디바운스)</label>
+          <input id="git-autosync-toggle" type="checkbox" checked />
+        </div>
+        <div class="form-group">
+          <label>동기화 대기 중인 파일 (<code>history/</code>, <code>prompts/</code>만 추적)</label>
+          <pre class="console-box console-sm" id="git-pending-files">변경 사항 없음</pre>
+        </div>
+        <div class="form-error hidden" id="git-modal-error"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-git-modal-pull" class="btn btn-ghost">⬇ Pull</button>
+        <button id="btn-git-modal-push" class="btn btn-primary">⬆ Commit & Push</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toast-container"></div>
+</body>
+</html>
