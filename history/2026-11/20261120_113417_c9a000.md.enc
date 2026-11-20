@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "alg": "AES-256-GCM",
+  "session_id": "20261120_113417_c9a000",
+  "updated_at": "2026-11-20T11:34:17+09:00",
+  "nonce": "OPc5mJq959hADpoW",
+  "ciphertext": "9jBT6smAopJhyS/3YoVOiwr95lZDanAQNycE17uLqK1ekV1GbQXSiaXGPdaBXIWQII37Fa3bW8JClTGrmKln9i9L0QW4JUDzJVy7nRjSVC7OttGa47rcDam4XxsL5qe9arjCjhw21g7V6yLwG6TAgt2TKe/V/cU2PjQLBQ/Vd0vIEWPB3lAbpAT0msGG+PlxwqMNQFLN2SibaFtWIpJ1ROkgjt84b9H9+Pp2V2B/8maMKasM6sUtxjCLvFtTpRaL5tDom4CnJiVhO2ctnUNw/WK+xOSlaenQl3ZV0lO1VawPxoazC4YtUNDy7REpcckECWFbnATPN2VHXgjbDUIWWDDg5FqCuX09JeYYfFqjeelnUR7+umh4qmp9mN+WrPsJQ6ijrfAvn1JdUlC24gDSvjaS8u5IUkGpexPhe90UAb+fuBsuG3u25w=="
+}
