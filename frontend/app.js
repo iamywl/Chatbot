@@ -13,6 +13,10 @@
     vault: { initialized: false, unlocked: false, kdf: null, auto_lock_minutes: 0, encrypted_sessions_count: 0 },
     model: { status: "unloaded", model_id: "mlx-community/gpt-oss-120b-MXFP4-Q4", memory: {}, available_models: [] },
     git: { is_repo: false, pending_count: 0, auto_sync: true, syncing: false },
+    workspace: { root: "", name: "Workspace", recent_roots: [] },
+    agentMode: "approve",
+    attachedFiles: [],
+    previewFilePath: "",
     personas: [],
     sessions: [],
     currentSession: null,
@@ -745,6 +749,215 @@
     await loadSessions();
   }
 
+  // ----- Workspace & Agent Tools UI -----
+
+  const TOOL_ICONS = {
+    list_dir: "📂",
+    read_file: "📄",
+    search_files: "🔎",
+    write_file: "📝",
+    edit_file: "✏️",
+    run_command: "💻",
+  };
+
+  function renderDiffElement(diffText) {
+    const pre = document.createElement("div");
+    pre.className = "diff-view";
+    const lines = String(diffText || "").split("\n");
+    for (const ln of lines) {
+      const span = document.createElement("span");
+      let cls = "diff-line";
+      if (ln.startsWith("+") && !ln.startsWith("+++")) cls += " add";
+      else if (ln.startsWith("-") && !ln.startsWith("---")) cls += " del";
+      else if (ln.startsWith("@@")) cls += " hunk";
+      span.className = cls;
+      span.textContent = ln;
+      pre.appendChild(span);
+    }
+    return pre;
+  }
+
+  function createToolCardElement(te, options = {}) {
+    const { open = false, status = null } = options;
+    const details = document.createElement("details");
+    details.className = "tool-card";
+    if (open) details.open = true;
+
+    const icon = TOOL_ICONS[te.name] || "🔧";
+    const summaryText = te.summary || `${te.name}(${JSON.stringify(te.arguments || {}).slice(0, 80)})`;
+
+    let badgeText = "완료";
+    let badgeClass = "ok";
+    if (status === "running") {
+      badgeText = "실행 중...";
+      badgeClass = "running";
+    } else if (status === "waiting") {
+      badgeText = "승인 대기";
+      badgeClass = "waiting";
+      details.classList.add("pending-approval");
+      if (te.high_risk) details.classList.add("high-risk");
+    } else if (te.approved === false) {
+      badgeText = "거절됨";
+      badgeClass = "rejected";
+    } else if (te.ok === false) {
+      badgeText = "오류";
+      badgeClass = "error";
+    }
+
+    details.innerHTML = `
+      <summary class="tool-card-summary">
+        <span class="tool-card-title"><span>${icon}</span><span>${escapeHtml(summaryText)}</span></span>
+        <span class="tool-status-badge ${badgeClass}">${badgeText}</span>
+      </summary>
+      <div class="tool-card-body"></div>
+    `;
+
+    const body = details.querySelector(".tool-card-body");
+    if (te.diff) {
+      body.appendChild(renderDiffElement(te.diff));
+    }
+    if (te.output) {
+      const pre = document.createElement("pre");
+      pre.className = "tool-output-pre";
+      pre.textContent = te.output;
+      body.appendChild(pre);
+    } else if (!te.diff && te.arguments && Object.keys(te.arguments).length > 0) {
+      const pre = document.createElement("pre");
+      pre.className = "tool-output-pre";
+      pre.textContent = JSON.stringify(te.arguments, null, 2);
+      body.appendChild(pre);
+    }
+    return details;
+  }
+
+  async function refreshWorkspaceStatus() {
+    try {
+      state.workspace = await api("/api/workspace/status");
+      renderWorkspaceHeader();
+      if (!$("workspace-panel").classList.contains("collapsed")) {
+        await loadWorkspaceTree(".");
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  function renderWorkspaceHeader() {
+    const ws = state.workspace;
+    const countSuffix = state.attachedFiles.length ? ` (${state.attachedFiles.length})` : "";
+    $("workspace-btn-label").textContent = `${ws.name || "Workspace"}${countSuffix}`;
+    $("ws-path-input").value = ws.root || "";
+    const recentSelect = $("ws-recent-select");
+    recentSelect.innerHTML = (ws.recent_roots || [])
+      .map(
+        (r) =>
+          `<option value="${escapeHtml(r)}" ${r === ws.root ? "selected" : ""}>${escapeHtml(r)}</option>`
+      )
+      .join("");
+  }
+
+  function toggleAttachedFile(relPath) {
+    const idx = state.attachedFiles.indexOf(relPath);
+    if (idx === -1) {
+      if (state.attachedFiles.length >= 10) {
+        toast("한 번에 최대 10개 파일까지 첨부할 수 있습니다.", "error");
+        return;
+      }
+      state.attachedFiles.push(relPath);
+      toast(`첨부됨: ${relPath}`, "success");
+    } else {
+      state.attachedFiles.splice(idx, 1);
+    }
+    renderAttachedFilesBar();
+    renderWorkspaceHeader();
+    document.querySelectorAll(".ws-node-attach").forEach((btn) => {
+      const attached = state.attachedFiles.includes(btn.dataset.fpath);
+      btn.classList.toggle("attached", attached);
+      btn.textContent = attached ? "✓ 첨부됨" : "＋ 첨부";
+    });
+  }
+
+  function renderAttachedFilesBar() {
+    const bar = $("attached-files-bar");
+    if (!state.attachedFiles.length) {
+      bar.classList.add("hidden");
+      bar.innerHTML = "";
+      return;
+    }
+    bar.classList.remove("hidden");
+    bar.innerHTML = "";
+    for (const rel of state.attachedFiles) {
+      const chip = document.createElement("span");
+      chip.className = "attached-chip";
+      chip.innerHTML = `<span>📄 ${escapeHtml(rel)}</span><button title="첨부 해제">✕</button>`;
+      chip.querySelector("button").addEventListener("click", () => toggleAttachedFile(rel));
+      bar.appendChild(chip);
+    }
+  }
+
+  async function loadWorkspaceTree(relPath = ".", targetContainer = null) {
+    const container = targetContainer || $("ws-tree");
+    try {
+      const data = await api(`/api/workspace/tree?path=${encodeURIComponent(relPath)}`);
+      container.innerHTML = "";
+      if (!data.entries.length) {
+        container.innerHTML = '<div class="empty-hint">비어 있음</div>';
+        return;
+      }
+      for (const entry of data.entries) {
+        const wrap = document.createElement("div");
+        const row = document.createElement("div");
+        row.className = "ws-node-row";
+        const attached = state.attachedFiles.includes(entry.path);
+
+        if (entry.is_dir) {
+          row.innerHTML = `<div class="ws-node-left"><span class="ws-dir-arrow">▸</span><span>📁</span><span>${escapeHtml(entry.name)}</span></div>`;
+          const childrenBox = document.createElement("div");
+          childrenBox.className = "ws-children hidden";
+          let loaded = false;
+          row.addEventListener("click", async () => {
+            const isHidden = childrenBox.classList.toggle("hidden");
+            row.querySelector(".ws-dir-arrow").textContent = isHidden ? "▸" : "▾";
+            if (!isHidden && !loaded) {
+              loaded = true;
+              childrenBox.innerHTML = '<div class="empty-hint">로딩...</div>';
+              await loadWorkspaceTree(entry.path, childrenBox);
+            }
+          });
+          wrap.appendChild(row);
+          wrap.appendChild(childrenBox);
+        } else {
+          row.innerHTML = `
+            <div class="ws-node-left"><span>📄</span><span title="${escapeHtml(entry.path)}">${escapeHtml(entry.name)}</span></div>
+            <button class="ws-node-attach ${attached ? "attached" : ""}" data-fpath="${escapeHtml(entry.path)}">${attached ? "✓ 첨부됨" : "＋ 첨부"}</button>
+          `;
+          row.querySelector(".ws-node-attach").addEventListener("click", (e) => {
+            e.stopPropagation();
+            toggleAttachedFile(entry.path);
+          });
+          row.addEventListener("click", () => openFilePreview(entry.path));
+          wrap.appendChild(row);
+        }
+        container.appendChild(wrap);
+      }
+    } catch (err) {
+      container.innerHTML = `<div class="empty-hint">${escapeHtml(err.message)}</div>`;
+    }
+  }
+
+  async function openFilePreview(relPath) {
+    try {
+      const info = await api(`/api/workspace/file?path=${encodeURIComponent(relPath)}&start_line=1&end_line=400`);
+      state.previewFilePath = info.path;
+      $("file-preview-title").textContent = `📄 ${info.path}`;
+      $("file-preview-meta").textContent = `lines ${info.start_line}–${info.end_line} / 총 ${info.total_lines}줄`;
+      $("file-preview-content").textContent = info.content;
+      $("file-preview-modal").classList.remove("hidden");
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  }
+
   // ----- Chat Rendering -----
 
   function renderCurrentSession() {
@@ -820,7 +1033,17 @@
     bubble.className = "msg-bubble";
 
     if (msg.role === "user") {
-      bubble.textContent = msg.content || "";
+      if (msg.attached_files && msg.attached_files.length) {
+        const tags = document.createElement("div");
+        tags.className = "msg-attached-tags";
+        tags.innerHTML = msg.attached_files
+          .map((f) => `<span class="msg-attached-tag">📄 ${escapeHtml(f)}</span>`)
+          .join("");
+        bubble.appendChild(tags);
+      }
+      const txtDiv = document.createElement("div");
+      txtDiv.textContent = msg.content || "";
+      bubble.appendChild(txtDiv);
     } else {
       if (msg.reasoning) {
         const details = document.createElement("details");
@@ -834,6 +1057,14 @@
         `;
         details.querySelector(".reasoning-content").textContent = msg.reasoning;
         bubble.appendChild(details);
+      }
+      if (msg.tool_events && msg.tool_events.length) {
+        const toolWrap = document.createElement("div");
+        toolWrap.className = "tool-cards-wrap";
+        for (const te of msg.tool_events) {
+          toolWrap.appendChild(createToolCardElement(te, { open: false }));
+        }
+        bubble.appendChild(toolWrap);
       }
       bubble.appendChild(renderMarkdown(msg.content || ""));
     }
@@ -921,6 +1152,8 @@
     const welcome = container.querySelector(".welcome-card");
     if (welcome) welcome.remove();
 
+    const attachedSnapshot = regenerate ? [] : [...state.attachedFiles];
+
     if (regenerate) {
       // Remove last assistant row from UI
       const lastRow = container.lastElementChild;
@@ -930,7 +1163,16 @@
     } else {
       $("chat-input").value = "";
       autoResizeTextarea();
-      const tempUserMsg = { id: "", role: "user", content: text, ts: new Date().toISOString() };
+      state.attachedFiles = [];
+      renderAttachedFilesBar();
+      renderWorkspaceHeader();
+      const tempUserMsg = {
+        id: "",
+        role: "user",
+        content: text,
+        attached_files: attachedSnapshot,
+        ts: new Date().toISOString(),
+      };
       container.appendChild(createMessageNode(tempUserMsg, false));
     }
 
@@ -948,6 +1190,7 @@
             </summary>
             <div class="reasoning-content"></div>
           </details>
+          <div class="tool-cards-wrap live-tools hidden"></div>
           <div class="live-content markdown-body"><span class="muted-note">응답 준비 중...</span></div>
         </div>
         <div class="msg-footer">
@@ -963,8 +1206,12 @@
     const reasoningTitle = liveRow.querySelector(".reasoning-title");
     const reasoningPulse = liveRow.querySelector(".thinking-pulse");
     const reasoningContentEl = liveRow.querySelector(".reasoning-content");
+    const liveToolsEl = liveRow.querySelector(".live-tools");
     const liveContentEl = liveRow.querySelector(".live-content");
     const liveMetaEl = liveRow.querySelector(".live-meta");
+
+    const liveToolCards = new Map();
+    let workspaceModified = false;
 
     let userToggledReasoning = false;
     reasoningDetails.querySelector("summary").addEventListener("click", () => {
@@ -1010,6 +1257,8 @@
           content: text,
           params: readCurrentParamsUI(),
           regenerate,
+          agent_mode: state.agentMode,
+          attached_files: attachedSnapshot,
         }),
       });
 
@@ -1061,6 +1310,67 @@
             answerText += payload.text || "";
             liveMetaEl.textContent = "답변 생성 중...";
             scheduleRender();
+          } else if (evType === "tool_start") {
+            liveToolsEl.classList.remove("hidden");
+            const card = createToolCardElement(payload, {
+              open: Boolean(payload.requires_approval),
+              status: payload.requires_approval ? "waiting" : "running",
+            });
+            liveToolsEl.appendChild(card);
+            liveToolCards.set(payload.id, card);
+            liveMetaEl.textContent = payload.requires_approval
+              ? `⚠️ 사용자 승인 대기 중: ${payload.name}`
+              : `🔧 도구 실행 중: ${payload.name}...`;
+            scrollToBottom();
+          } else if (evType === "approval_required") {
+            const card = liveToolCards.get(payload.tool_call_id);
+            if (card) {
+              card.open = true;
+              const body = card.querySelector(".tool-card-body");
+              const bar = document.createElement("div");
+              bar.className = `approval-bar ${payload.high_risk ? "high-risk" : ""}`;
+              const warnPrefix = payload.high_risk
+                ? "🚨 고위험 명령어입니다! 신중히 확인 후 승인하세요."
+                : "로컬 워크스페이스 변경/실행 승인 요청";
+              bar.innerHTML = `
+                <span>${warnPrefix}</span>
+                <div class="approval-actions">
+                  <button class="btn btn-xs btn-success" data-dec="approve">✅ 승인 & 실행</button>
+                  <button class="btn btn-xs btn-danger" data-dec="reject">❌ 거절</button>
+                </div>
+              `;
+              const sendDecision = async (approved) => {
+                bar.querySelectorAll("button").forEach((b) => (b.disabled = true));
+                bar.querySelector("span").textContent = approved ? "승인됨 · 실행 중..." : "거절됨";
+                try {
+                  await api(`/api/agent/approvals/${encodeURIComponent(payload.approval_id)}`, {
+                    method: "POST",
+                    body: JSON.stringify({ approved }),
+                  });
+                } catch (e) {
+                  toast(`승인 전송 오류: ${e.message}`, "error");
+                }
+              };
+              bar.querySelector('[data-dec="approve"]').addEventListener("click", () => sendDecision(true));
+              bar.querySelector('[data-dec="reject"]').addEventListener("click", () => sendDecision(false));
+              body.appendChild(bar);
+              scrollToBottom();
+            }
+          } else if (evType === "tool_result") {
+            if (["write_file", "edit_file", "run_command"].includes(payload.name) && payload.ok) {
+              workspaceModified = true;
+            }
+            const oldCard = liveToolCards.get(payload.id);
+            const newCard = createToolCardElement(payload, { open: false });
+            if (oldCard) {
+              oldCard.replaceWith(newCard);
+            } else {
+              liveToolsEl.classList.remove("hidden");
+              liveToolsEl.appendChild(newCard);
+            }
+            liveToolCards.set(payload.id, newCard);
+            liveMetaEl.textContent = "도구 결과 분석 중...";
+            scrollToBottom();
           } else if (evType === "error") {
             throw new Error(payload.detail || "스트리밍 오류");
           } else if (evType === "done") {
@@ -1075,6 +1385,9 @@
       await openSessionForce(sessionId);
       await loadSessions();
       refreshGitStatus();
+      if (workspaceModified && !$("workspace-panel").classList.contains("collapsed")) {
+        loadWorkspaceTree(".");
+      }
     } catch (err) {
       toast(`채팅 오류: ${err.message}`, "error");
       liveMetaEl.textContent = `오류: ${err.message}`;
@@ -1471,6 +1784,80 @@
       }
     });
 
+    // Workspace Explorer & Agent Mode Controls
+    $("agent-mode-select").addEventListener("change", (e) => {
+      state.agentMode = e.target.value;
+      const labels = {
+        approve: "⚡ 에이전트(승인) 모드: 읽기 자동 · 수정/명령 실행 전 승인 확인",
+        read_only: "🔍 읽기 전용 모드: 파일 탐색/읽기/검색만 허용",
+        auto: "🚀 자율 실행 모드: 읽기/쓰기/안전 명령 자동 실행 (고위험 명령만 승인)",
+        off: "💬 일반 채팅 모드: 로컬 파일시스템 도구 비활성화",
+      };
+      toast(labels[state.agentMode] || state.agentMode);
+    });
+
+    const toggleWorkspacePanel = async (forceClose = false) => {
+      const panel = $("workspace-panel");
+      const shouldCollapse = forceClose ? true : !panel.classList.contains("collapsed");
+      panel.classList.toggle("collapsed", shouldCollapse);
+      if (!shouldCollapse) {
+        await refreshWorkspaceStatus();
+        await loadWorkspaceTree(".");
+      }
+    };
+    $("btn-toggle-workspace").addEventListener("click", () => toggleWorkspacePanel(false));
+    $("btn-ws-close").addEventListener("click", () => toggleWorkspacePanel(true));
+    $("btn-ws-refresh").addEventListener("click", () => loadWorkspaceTree("."));
+
+    const switchWorkspacePath = async (pathVal) => {
+      if (!pathVal.trim()) return;
+      try {
+        state.workspace = await api("/api/workspace/select", {
+          method: "POST",
+          body: JSON.stringify({ path: pathVal.trim() }),
+        });
+        state.attachedFiles = [];
+        renderAttachedFilesBar();
+        renderWorkspaceHeader();
+        await loadWorkspaceTree(".");
+        toast(`워크스페이스 변경: ${state.workspace.name}`, "success");
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+    $("ws-path-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        switchWorkspacePath($("ws-path-input").value);
+      }
+    });
+    $("ws-recent-select").addEventListener("change", (e) => {
+      switchWorkspacePath(e.target.value);
+    });
+    $("btn-ws-pick").addEventListener("click", async () => {
+      try {
+        const res = await api("/api/workspace/pick-native", { method: "POST" });
+        if (!res.cancelled && res.workspace) {
+          state.workspace = res.workspace;
+          state.attachedFiles = [];
+          renderAttachedFilesBar();
+          renderWorkspaceHeader();
+          await loadWorkspaceTree(".");
+          toast(`워크스페이스 연결: ${state.workspace.name}`, "success");
+        }
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    });
+    $("btn-preview-attach").addEventListener("click", () => {
+      if (state.previewFilePath) {
+        if (!state.attachedFiles.includes(state.previewFilePath)) {
+          toggleAttachedFile(state.previewFilePath);
+        }
+        $("file-preview-modal").classList.add("hidden");
+      }
+    });
+
     // Chat Composer
     const chatInput = $("chat-input");
     chatInput.addEventListener("input", autoResizeTextarea);
@@ -1500,7 +1887,12 @@
 
   async function init() {
     bindEvents();
-    await Promise.all([refreshVaultStatus(), refreshModelStatus(), refreshGitStatus()]);
+    await Promise.all([
+      refreshVaultStatus(),
+      refreshModelStatus(),
+      refreshGitStatus(),
+      refreshWorkspaceStatus(),
+    ]);
     if (state.vault.unlocked) {
       await onVaultUnlocked();
     }

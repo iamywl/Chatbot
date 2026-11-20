@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import urllib.parse
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -21,18 +23,57 @@ from backend.crypto_vault import (
     VaultLockedError,
 )
 from backend.git_sync import GitSyncWorker
-from backend.llm_client import build_llm_messages, stream_chat_completion
+from backend.llm_client import (
+    build_agent_system_instructions,
+    build_llm_messages,
+    stream_chat_completion,
+)
 from backend.model_manager import ModelManager
 from backend.storage import EncryptedSessionStorage, new_message_id, now_iso
+from backend.workspace_tools import (
+    WorkspaceManager,
+    WorkspaceSecurityError,
+    get_tool_schemas,
+)
+
+MAX_AGENT_STEPS = 12
+
+
+@dataclass
+class PendingApproval:
+    approval_id: str
+    session_id: str
+    tool_name: str
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    approved: bool | None = None
+
 
 # Singletons for local personal desktop app
 vault = CryptoVault()
 storage = EncryptedSessionStorage(vault)
 model_manager = ModelManager()
 git_sync = GitSyncWorker()
+workspace_manager = WorkspaceManager()
 
-# Track active generation cancellation events per session
+# Track active generation cancellation events & pending tool approvals
 active_streams: dict[str, asyncio.Event] = {}
+pending_approvals: dict[str, PendingApproval] = {}
+
+
+def _cancel_session_streams(session_id: str | None = None) -> None:
+    if session_id is None:
+        for ev in active_streams.values():
+            ev.set()
+        for pa in list(pending_approvals.values()):
+            pa.approved = False
+            pa.event.set()
+    else:
+        if session_id in active_streams:
+            active_streams[session_id].set()
+        for pa in list(pending_approvals.values()):
+            if pa.session_id == session_id:
+                pa.approved = False
+                pa.event.set()
 
 
 @asynccontextmanager
@@ -41,8 +82,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
-        for ev in active_streams.values():
-            ev.set()
+        _cancel_session_streams()
         await git_sync.shutdown()
         await model_manager.shutdown()
         vault.lock()
@@ -71,6 +111,11 @@ async def handle_vault_decrypt(_req: Request, exc: VaultDecryptError) -> JSONRes
 @app.exception_handler(VaultError)
 async def handle_vault_error(_req: Request, exc: VaultError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc), "code": "VAULT_ERROR"})
+
+
+@app.exception_handler(WorkspaceSecurityError)
+async def handle_workspace_security(_req: Request, exc: WorkspaceSecurityError) -> JSONResponse:
+    return JSONResponse(status_code=403, content={"detail": str(exc), "code": "WORKSPACE_FORBIDDEN"})
 
 
 @app.exception_handler(FileNotFoundError)
@@ -128,6 +173,8 @@ class ChatRequest(BaseModel):
     content: str = ""
     params: dict[str, Any] | None = None
     regenerate: bool = False
+    agent_mode: str = Field(default="approve", pattern="^(off|read_only|approve|auto)$")
+    attached_files: list[str] = Field(default_factory=list)
 
 
 class PersonaSaveRequest(BaseModel):
@@ -136,6 +183,14 @@ class PersonaSaveRequest(BaseModel):
 
 class GitSettingsRequest(BaseModel):
     auto_sync: bool
+
+
+class WorkspaceSelectRequest(BaseModel):
+    path: str
+
+
+class ApprovalDecisionRequest(BaseModel):
+    approved: bool
 
 
 # ----- Vault API -----
@@ -176,9 +231,7 @@ async def unlock_vault(req: VaultUnlockRequest) -> dict[str, Any]:
 
 @app.post("/api/vault/lock")
 async def lock_vault() -> dict[str, Any]:
-    # Stop any ongoing chat streams before wiping key
-    for ev in active_streams.values():
-        ev.set()
+    _cancel_session_streams()
     vault.lock()
     st = vault.status()
     st["encrypted_sessions_count"] = storage.count_encrypted_files()
@@ -218,8 +271,7 @@ async def load_model(req: ModelLoadRequest | None = None) -> dict[str, Any]:
 
 @app.post("/api/model/unload")
 async def unload_model() -> dict[str, Any]:
-    for ev in active_streams.values():
-        ev.set()
+    _cancel_session_streams()
     return await model_manager.unload()
 
 
@@ -227,6 +279,55 @@ async def unload_model() -> dict[str, Any]:
 async def update_model_settings(req: ModelSettingsRequest) -> dict[str, Any]:
     model_manager.set_idle_unload_minutes(req.idle_unload_minutes)
     return model_manager.get_state()
+
+
+# ----- Workspace & Local Filesystem API (Antigravity Mode) -----
+
+@app.get("/api/workspace/status")
+async def get_workspace_status() -> dict[str, Any]:
+    return workspace_manager.get_status()
+
+
+@app.post("/api/workspace/select")
+async def select_workspace(req: WorkspaceSelectRequest) -> dict[str, Any]:
+    return workspace_manager.set_workspace(req.path)
+
+
+@app.post("/api/workspace/pick-native")
+async def pick_workspace_native() -> dict[str, Any]:
+    return await workspace_manager.pick_native_folder()
+
+
+@app.get("/api/workspace/tree")
+async def get_workspace_tree(path: str = Query(default=".")) -> dict[str, Any]:
+    return {
+        "root": str(workspace_manager.root),
+        "path": path,
+        "entries": workspace_manager.list_tree(path),
+    }
+
+
+@app.get("/api/workspace/file")
+async def get_workspace_file(
+    path: str = Query(...),
+    start_line: int = Query(default=1, ge=1),
+    end_line: int | None = Query(default=None, ge=1),
+) -> dict[str, Any]:
+    return workspace_manager.read_file_for_context(
+        path, start_line=start_line, end_line=end_line
+    )
+
+
+@app.post("/api/agent/approvals/{approval_id}")
+async def resolve_agent_approval(
+    approval_id: str, req: ApprovalDecisionRequest
+) -> dict[str, Any]:
+    pa = pending_approvals.get(approval_id)
+    if pa is None:
+        raise HTTPException(status_code=404, detail="만료되었거나 존재하지 않는 승인 요청입니다.")
+    pa.approved = req.approved
+    pa.event.set()
+    return {"approval_id": approval_id, "approved": req.approved}
 
 
 # ----- Sessions API -----
@@ -279,8 +380,7 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
 async def delete_session(session_id: str) -> dict[str, Any]:
     if not vault.is_unlocked():
         raise VaultLockedError("Vault가 잠겨 있습니다.")
-    if session_id in active_streams:
-        active_streams[session_id].set()
+    _cancel_session_streams(session_id)
     deleted = storage.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
@@ -312,7 +412,7 @@ async def export_session(session_id: str) -> PlainTextResponse:
     )
 
 
-# ----- Chat Streaming API -----
+# ----- Chat & Agentic Streaming API -----
 
 def _auto_title(text: str) -> str:
     first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "새 대화")
@@ -326,13 +426,26 @@ def _sse(event_type: str, payload: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _build_attached_files_context(attached_files: list[str]) -> str:
+    if not attached_files:
+        return ""
+    blocks: list[str] = ["\n\n---\n[사용자가 첨부한 로컬 워크스페이스 파일]"]
+    for rel in attached_files[:10]:
+        try:
+            info = workspace_manager.read_file_for_context(rel, start_line=1, end_line=350)
+            blocks.append(
+                f"\n### File: `{info['path']}` (lines {info['start_line']}-{info['end_line']}/{info['total_lines']})\n```\n{info['raw_content']}\n```"
+            )
+        except Exception as exc:
+            blocks.append(f"\n### File: `{rel}`\n(읽기 실패: {exc})")
+    return "\n".join(blocks)
+
+
 @app.post("/api/sessions/{session_id}/stop")
 async def stop_generation(session_id: str) -> dict[str, Any]:
-    ev = active_streams.get(session_id)
-    if ev is not None:
-        ev.set()
-        return {"stopping": True}
-    return {"stopping": False}
+    had = session_id in active_streams
+    _cancel_session_streams(session_id)
+    return {"stopping": had}
 
 
 @app.post("/api/sessions/{session_id}/chat")
@@ -344,28 +457,32 @@ async def chat_stream(session_id: str, req: ChatRequest) -> StreamingResponse:
     if state["status"] != "ready":
         raise HTTPException(
             status_code=503,
-            detail="로컬 모델이 메모리에 올라가 있지 않습니다. 상단의 'Load Model' 버튼을 눌러 모델을 적재해 주세요.",
+            detail="로컬 모델이 메모리에 올라가 있지 않습니다. 상단의 'Load' 버튼을 눌러 모델을 적재해 주세요.",
         )
 
     session = storage.get_session(session_id)
+    attached_files = [f.strip() for f in req.attached_files if f.strip()]
 
     if req.regenerate:
-        # Remove trailing assistant message(s) so we regenerate from the last user prompt
         while session["messages"] and session["messages"][-1].get("role") == "assistant":
             session["messages"].pop()
         if not session["messages"] or session["messages"][-1].get("role") != "user":
             raise HTTPException(status_code=400, detail="재생성할 사용자 메시지가 없습니다.")
+        if not attached_files:
+            attached_files = list(session["messages"][-1].get("attached_files") or [])
     else:
         content = req.content.strip()
         if not content:
             raise HTTPException(status_code=400, detail="메시지 내용을 입력하세요.")
-        user_msg = {
+        user_msg: dict[str, Any] = {
             "id": new_message_id(),
             "role": "user",
             "content": content,
             "reasoning": "",
             "ts": now_iso(),
         }
+        if attached_files:
+            user_msg["attached_files"] = attached_files
         session["messages"].append(user_msg)
         if session.get("title") in ("새 대화", "", "제목 없는 대화"):
             session["title"] = _auto_title(content)
@@ -374,15 +491,19 @@ async def chat_stream(session_id: str, req: ChatRequest) -> StreamingResponse:
     session["params"] = merged_params
     session["model"] = model_manager.model_id or session.get("model") or DEFAULT_MODEL_ID
 
-    # Save user prompt immediately in encrypted storage
     storage.save_session(session)
 
+    agent_mode = req.agent_mode
+    active_tools = get_tool_schemas(agent_mode)
+    extra_sys = build_agent_system_instructions(agent_mode, str(workspace_manager.root))
     system_prompt = storage.get_persona_prompt(session.get("persona", "default"))
-    llm_messages = build_llm_messages(system_prompt, session["messages"])
+    llm_messages = build_llm_messages(system_prompt, session["messages"], extra_system=extra_sys)
 
-    # Cancel any existing stream on the same session
-    if session_id in active_streams:
-        active_streams[session_id].set()
+    # Inject attached file contents into the final user turn sent to the LLM
+    if attached_files and llm_messages and llm_messages[-1]["role"] == "user":
+        llm_messages[-1]["content"] += _build_attached_files_context(attached_files)
+
+    _cancel_session_streams(session_id)
     cancel_event = asyncio.Event()
     active_streams[session_id] = cancel_event
 
@@ -390,7 +511,9 @@ async def chat_stream(session_id: str, req: ChatRequest) -> StreamingResponse:
         assistant_id = new_message_id()
         reasoning_buf: list[str] = []
         content_buf: list[str] = []
-        metrics: dict[str, Any] = {}
+        tool_events: list[dict[str, Any]] = []
+        last_metrics: dict[str, Any] = {}
+        total_completion_tokens = 0
         cancelled = False
 
         model_manager.begin_generation()
@@ -401,43 +524,191 @@ async def chat_stream(session_id: str, req: ChatRequest) -> StreamingResponse:
                     "session_id": session_id,
                     "title": session["title"],
                     "assistant_id": assistant_id,
+                    "agent_mode": agent_mode,
+                    "workspace": str(workspace_manager.root),
                 },
             )
 
-            async for ev in stream_chat_completion(
-                messages=llm_messages,
-                params=merged_params,
-                cancel_event=cancel_event,
-            ):
-                ev_type = ev["type"]
-                if ev_type == "reasoning":
-                    reasoning_buf.append(ev["text"])
-                    yield _sse("reasoning", {"text": ev["text"]})
-                elif ev_type == "content":
-                    content_buf.append(ev["text"])
-                    yield _sse("content", {"text": ev["text"]})
-                elif ev_type == "keepalive":
-                    yield _sse("keepalive", {"detail": ev["detail"]})
-                elif ev_type == "done":
-                    metrics = ev.get("metrics") or {}
-                    cancelled = bool(ev.get("cancelled", False))
+            for step in range(MAX_AGENT_STEPS):
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
+
+                step_tool_calls: list[dict[str, Any]] = []
+                step_content_buf: list[str] = []
+
+                async for ev in stream_chat_completion(
+                    messages=llm_messages,
+                    params=merged_params,
+                    tools=active_tools if active_tools else None,
+                    cancel_event=cancel_event,
+                ):
+                    ev_type = ev["type"]
+                    if ev_type == "reasoning":
+                        reasoning_buf.append(ev["text"])
+                        yield _sse("reasoning", {"text": ev["text"]})
+                    elif ev_type == "content":
+                        step_content_buf.append(ev["text"])
+                        content_buf.append(ev["text"])
+                        yield _sse("content", {"text": ev["text"]})
+                    elif ev_type == "tool_call":
+                        step_tool_calls.append(
+                            {
+                                "id": f"call_{secrets.token_hex(4)}",
+                                "name": ev["name"],
+                                "arguments": ev.get("arguments") or {},
+                            }
+                        )
+                    elif ev_type == "keepalive":
+                        yield _sse("keepalive", {"detail": ev["detail"]})
+                    elif ev_type == "done":
+                        last_metrics = ev.get("metrics") or {}
+                        total_completion_tokens += int(
+                            last_metrics.get("completion_tokens") or 0
+                        )
+                        cancelled = bool(ev.get("cancelled", False))
+
+                if cancelled or not step_tool_calls or not active_tools:
+                    break
+
+                # Append assistant's tool call message (gpt-oss Harmony template expects dict arguments!)
+                llm_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "".join(step_content_buf).strip(),
+                        "tool_calls": [
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": tc["arguments"],
+                                },
+                            }
+                            for tc in step_tool_calls
+                        ],
+                    }
+                )
+
+                # Execute each requested tool (with human-in-the-loop approval when needed)
+                for tc in step_tool_calls:
+                    if cancel_event.is_set():
+                        cancelled = True
+                        break
+
+                    tc_id = tc["id"]
+                    t_name = tc["name"]
+                    t_args = tc["arguments"]
+                    preview = workspace_manager.prepare_tool_preview(t_name, t_args)
+                    needs_approval = workspace_manager.requires_approval(
+                        agent_mode, t_name, t_args
+                    )
+
+                    yield _sse(
+                        "tool_start",
+                        {
+                            "id": tc_id,
+                            "name": t_name,
+                            "arguments": t_args,
+                            "summary": preview["summary"],
+                            "diff": preview["diff"],
+                            "is_write": preview["is_write"],
+                            "high_risk": preview["high_risk"],
+                            "requires_approval": needs_approval,
+                        },
+                    )
+
+                    approved = True
+                    if needs_approval:
+                        approval_id = f"apr_{secrets.token_hex(6)}"
+                        pa = PendingApproval(
+                            approval_id=approval_id,
+                            session_id=session_id,
+                            tool_name=t_name,
+                        )
+                        pending_approvals[approval_id] = pa
+                        yield _sse(
+                            "approval_required",
+                            {
+                                "approval_id": approval_id,
+                                "tool_call_id": tc_id,
+                                "name": t_name,
+                                "arguments": t_args,
+                                "summary": preview["summary"],
+                                "diff": preview["diff"],
+                                "high_risk": preview["high_risk"],
+                            },
+                        )
+                        try:
+                            await pa.event.wait()
+                            approved = bool(pa.approved) and not cancel_event.is_set()
+                        finally:
+                            pending_approvals.pop(approval_id, None)
+
+                    if cancel_event.is_set():
+                        cancelled = True
+                        break
+
+                    if approved:
+                        result = await workspace_manager.execute_tool(
+                            agent_mode, t_name, t_args
+                        )
+                    else:
+                        result = {
+                            "ok": False,
+                            "output": "사용자가 이 도구 실행을 거절했습니다. 수정/실행하지 말고 사용자에게 설명하거나 대안을 물어보세요.",
+                            "diff": preview["diff"],
+                        }
+
+                    tool_record = {
+                        "id": tc_id,
+                        "name": t_name,
+                        "arguments": t_args,
+                        "summary": preview["summary"],
+                        "ok": bool(result["ok"]),
+                        "approved": approved,
+                        "output": str(result["output"])[:4000],
+                        "diff": str(result.get("diff") or "")[:6000],
+                    }
+                    tool_events.append(tool_record)
+
+                    yield _sse("tool_result", tool_record)
+
+                    llm_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "name": t_name,
+                            "content": result["output"],
+                        }
+                    )
+
+                if cancelled:
+                    break
+                if content_buf and not content_buf[-1].endswith("\n"):
+                    content_buf.append("\n\n")
+                    yield _sse("content", {"text": "\n\n"})
 
             final_content = "".join(content_buf).strip()
             final_reasoning = "".join(reasoning_buf).strip()
-
-            # Edge case: if model stopped mid-reasoning before emitting final content
-            if not final_content and final_reasoning and cancelled:
+            if not final_content and (final_reasoning or tool_events) and cancelled:
                 final_content = "*(생성이 중단되었습니다)*"
 
-            if final_content or final_reasoning:
-                assistant_msg = {
+            if total_completion_tokens > 0:
+                last_metrics["completion_tokens"] = total_completion_tokens
+
+            if final_content or final_reasoning or tool_events:
+                assistant_msg: dict[str, Any] = {
                     "id": assistant_id,
                     "role": "assistant",
                     "content": final_content,
                     "reasoning": final_reasoning,
                     "ts": now_iso(),
-                    "metrics": metrics,
+                    "metrics": last_metrics,
                 }
+                if tool_events:
+                    assistant_msg["tool_events"] = tool_events
+
                 if vault.is_unlocked():
                     latest = storage.get_session(session_id)
                     latest["messages"].append(assistant_msg)
@@ -451,7 +722,8 @@ async def chat_stream(session_id: str, req: ChatRequest) -> StreamingResponse:
                     "title": session["title"],
                     "assistant_id": assistant_id,
                     "cancelled": cancelled,
-                    "metrics": metrics,
+                    "metrics": last_metrics,
+                    "tool_count": len(tool_events),
                 },
             )
 

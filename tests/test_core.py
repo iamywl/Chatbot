@@ -334,3 +334,107 @@ def test_git_sync_worker_encrypted_push_and_pull(tmp_path: Path) -> None:
     assert "history/vault.json" in tracked
     assert ".md.enc" in tracked
 
+
+def test_harmony_parser_tool_calls_all_variants() -> None:
+    # Variant 1: immediate tool call stopped at <|call|> (no trailing <|call|> emitted)
+    sample1 = ' to=functions.read_file<|channel|>commentary json<|message|>{"path": "README.md"}'
+    p1 = HarmonyStreamParser()
+    evs1 = []
+    for ch in sample1:
+        evs1.extend(p1.feed(ch))
+    evs1.extend(p1.flush())
+    tool_calls1 = [v for k, v in evs1 if k == "tool_call"]
+    assert tool_calls1 == [{"name": "read_file", "arguments": {"path": "README.md"}}]
+
+    # Variant 2: analysis reasoning followed by Harmony tool call
+    sample2 = (
+        '<|channel|>analysis<|message|>Need to edit file.<|end|>'
+        '<|start|>assistant to=functions.edit_file<|channel|>commentary json<|message|>'
+        '{"path": "app.py", "target": "a", "replacement": "b"}<|call|>'
+    )
+    p2 = HarmonyStreamParser()
+    evs2 = []
+    for ch in sample2:
+        evs2.extend(p2.feed(ch))
+    evs2.extend(p2.flush())
+    reasoning = "".join(v for k, v in evs2 if k == "reasoning")
+    tool_calls2 = [v for k, v in evs2 if k == "tool_call"]
+    assert reasoning == "Need to edit file."
+    assert tool_calls2 == [
+        {"name": "edit_file", "arguments": {"path": "app.py", "target": "a", "replacement": "b"}}
+    ]
+
+    # Variant 3: <|channel|>commentary to=functions.<name> <|constrain|>json<|message|>...
+    sample3 = '<|channel|>commentary to=functions.search_files <|constrain|>json<|message|>{"query": "TODO"}'
+    p3 = HarmonyStreamParser()
+    evs3 = p3.feed(sample3) + p3.flush()
+    assert [v for k, v in evs3 if k == "tool_call"] == [
+        {"name": "search_files", "arguments": {"query": "TODO"}}
+    ]
+
+
+def test_workspace_manager_sandbox_and_tools(tmp_path: Path) -> None:
+    import asyncio
+    from backend.workspace_tools import WorkspaceManager, WorkspaceSecurityError
+
+    ws_dir = tmp_path / "myproj"
+    ws_dir.mkdir()
+    (ws_dir / "hello.py").write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+    (ws_dir / ".env").write_text("SECRET=123\n", encoding="utf-8")
+    (ws_dir / "vault.key").write_text("CHATBOT-KEY-v1:xxx\n", encoding="utf-8")
+
+    wm = WorkspaceManager(initial_root=ws_dir)
+
+    # Sandbox blocks path traversal & sensitive files
+    with pytest.raises(WorkspaceSecurityError):
+        wm.resolve_safe_path("../outside.txt", allow_nonexistent=True)
+    with pytest.raises(WorkspaceSecurityError):
+        wm.resolve_safe_path(".env")
+    with pytest.raises(WorkspaceSecurityError):
+        wm.resolve_safe_path("vault.key")
+
+    # Tree hides sensitive files
+    tree_names = [e["name"] for e in wm.list_tree(".")]
+    assert "hello.py" in tree_names
+    assert ".env" not in tree_names
+    assert "vault.key" not in tree_names
+
+    # Read / Search tools work
+    r_read = asyncio.run(wm.execute_tool("read_only", "read_file", {"path": "hello.py"}))
+    assert r_read["ok"] and "def greet" in r_read["output"]
+
+    r_search = asyncio.run(wm.execute_tool("read_only", "search_files", {"query": "greet"}))
+    assert r_search["ok"] and "hello.py:1:" in r_search["output"]
+
+    # Read-only mode blocks write/exec tools
+    r_blocked = asyncio.run(
+        wm.execute_tool("read_only", "write_file", {"path": "new.txt", "content": "x"})
+    )
+    assert not r_blocked["ok"]
+
+    # Edit & Write produce unified diff and mutate file inside workspace
+    r_edit = asyncio.run(
+        wm.execute_tool(
+            "approve",
+            "edit_file",
+            {"path": "hello.py", "target": "return 'hi'", "replacement": "return 'hello'"},
+        )
+    )
+    assert r_edit["ok"]
+    assert "-    return 'hi'" in r_edit["diff"]
+    assert "+    return 'hello'" in r_edit["diff"]
+    assert "return 'hello'" in (ws_dir / "hello.py").read_text(encoding="utf-8")
+
+    # Shell command execution works inside workspace
+    r_cmd = asyncio.run(wm.execute_tool("approve", "run_command", {"command": "python3 -c 'import hello; print(hello.greet())'"}))
+    assert r_cmd["ok"]
+    assert "hello" in r_cmd["output"]
+
+    # Approval rules: auto approves normal write/cmd, STILL requires approval on high-risk commands
+    assert wm.requires_approval("approve", "read_file", {"path": "hello.py"}) is False
+    assert wm.requires_approval("approve", "edit_file", {"path": "hello.py"}) is True
+    assert wm.requires_approval("auto", "edit_file", {"path": "hello.py"}) is False
+    assert wm.requires_approval("auto", "run_command", {"command": "pytest"}) is False
+    assert wm.requires_approval("auto", "run_command", {"command": "rm -rf /tmp/abc"}) is True
+
+

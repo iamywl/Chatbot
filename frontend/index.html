@@ -126,6 +126,15 @@
             <select id="session-persona-select" class="select-compact" title="페르소나 선택"></select>
           </div>
           <div class="session-bar-right">
+            <select id="agent-mode-select" class="select-compact select-agent" title="로컬 파일시스템/터미널 에이전트 권한 모드">
+              <option value="approve" selected>⚡ 에이전트 (승인)</option>
+              <option value="read_only">🔍 읽기 전용</option>
+              <option value="auto">🚀 자율 실행</option>
+              <option value="off">💬 일반 채팅</option>
+            </select>
+            <button id="btn-toggle-workspace" class="btn btn-xs btn-ghost" title="로컬 워크스페이스 파일 탐색기 열기/닫기">
+              📁 <span id="workspace-btn-label">Workspace</span>
+            </button>
             <div class="segmented" id="reasoning-effort-group" title="gpt-oss-120b 추론 강도">
               <button data-effort="low" class="seg-btn">Low</button>
               <button data-effort="medium" class="seg-btn active">Med</button>
@@ -173,22 +182,49 @@
           <button id="btn-banner-load" class="btn btn-xs btn-primary">지금 메모리 적재 (Load)</button>
         </div>
 
+        <!-- Attached Context Files Bar -->
+        <div class="attached-files-bar hidden" id="attached-files-bar"></div>
+
         <!-- Composer -->
         <div class="composer-wrap">
           <div class="composer">
             <textarea
               id="chat-input"
               rows="1"
-              placeholder="메시지를 입력하세요... (Enter 전송, Shift+Enter 줄바꿈)"
+              placeholder="메시지를 입력하세요... (에이전트 모드에서 로컬 파일 읽기·수정·명령 실행 가능)"
             ></textarea>
             <div class="composer-actions">
-              <span class="composer-hint" id="composer-hint">AES-256-GCM 암호화 저장</span>
+              <span class="composer-hint" id="composer-hint">AES-256-GCM 암호화 · 워크스페이스 샌드박스</span>
               <button id="btn-send" class="btn btn-primary btn-send">전송</button>
               <button id="btn-stop" class="btn btn-danger btn-send hidden">중단</button>
             </div>
           </div>
         </div>
       </main>
+
+      <!-- Right Local Workspace Explorer Panel (Antigravity Mode) -->
+      <aside class="workspace-panel collapsed" id="workspace-panel">
+        <div class="ws-header">
+          <div class="ws-title-row">
+            <strong>📁 로컬 워크스페이스</strong>
+            <div class="ws-header-actions">
+              <button id="btn-ws-refresh" class="icon-btn btn-xs" title="새로고침">↻</button>
+              <button id="btn-ws-close" class="icon-btn btn-xs" title="닫기">✕</button>
+            </div>
+          </div>
+          <div class="ws-path-row">
+            <input id="ws-path-input" type="text" placeholder="/Users/... 경로 입력 후 Enter" />
+            <button id="btn-ws-pick" class="btn btn-xs btn-primary" title="macOS Finder에서 폴더 선택">Finder</button>
+          </div>
+          <div class="ws-recent-row">
+            <select id="ws-recent-select" class="select-full" title="최근 워크스페이스"></select>
+          </div>
+          <div class="ws-guard-note">🛡 허용 폴더 외부 및 <code>.env</code> / <code>*.key</code> 자동 차단</div>
+        </div>
+        <div class="ws-tree" id="ws-tree">
+          <div class="empty-hint">폴더를 불러오는 중...</div>
+        </div>
+      </aside>
     </div>
   </div>
 
@@ -411,6 +447,23 @@
       <div class="modal-footer">
         <button id="btn-git-modal-pull" class="btn btn-ghost">⬇ Pull</button>
         <button id="btn-git-modal-push" class="btn btn-primary">⬆ Commit & Push</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- File Preview Modal -->
+  <div class="modal-overlay hidden" id="file-preview-modal">
+    <div class="modal-card modal-lg">
+      <div class="modal-header">
+        <h3 id="file-preview-title">📄 파일 미리보기</h3>
+        <button class="icon-btn modal-close" data-close="file-preview-modal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="console-header">
+          <span id="file-preview-meta"></span>
+          <button id="btn-preview-attach" class="btn btn-xs btn-primary">＋ 채팅에 첨부</button>
+        </div>
+        <pre class="console-box file-preview-box" id="file-preview-content"></pre>
       </div>
     </div>
   </div>

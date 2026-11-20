@@ -9,6 +9,7 @@ Apple Silicon(M4 Max) 로컬 LLM(`mlx-community/gpt-oss-120b-MXFP4-Q4`) 기반 �
 - **개인 키 기반 Vault 복호화**: 패스프레이즈(`scrypt` 키 유도) 또는 개인 `.key` 파일로 과거 암호화 채팅을 복호화해 열람·검색할 수 있습니다. 키는 서버 메모리에만 임시 유지되며 디스크/Git에 저장되지 않습니다.
 - **Reasoning(CoT) 분리 스트리밍**: `gpt-oss-120b`의 Harmony 채널(`<|channel|>analysis` / `<|channel|>final`)을 실시간 분리해 사고 과정은 접기 UI로 보여주고, 멀티턴 컨텍스트에는 최종 답변만 재투입해 컨텍스트 폭발과 반복 루프를 방지합니다.
 - **멀티 세션 & 페르소나**: 다중 세션 생성·전환·검색·이름 변경·분기(Fork)·Markdown 내보내기 및 `prompts/*.md` 페르소나 관리.
+- **로컬 워크스페이스 코딩 에이전트 (Antigravity 모드)**: 원하는 로컬 폴더를 마운트해 파일 트리 탐색·컨텍스트 첨부는 물론, `gpt-oss-120b`가 스스로 `list_dir`, `read_file`, `search_files`, `write_file`, `edit_file`, `run_command` 도구를 호출하는 멀티스텝 에이전트로 동작합니다. 쓰기/명령 실행 시 Unified Diff 미리보기와 `[승인 / 거절]` 게이트를 제공하며, 워크스페이스 외부 경로 및 `.env`·`*.key` 접근은 원천 차단됩니다.
 
 ## 실행 방법
 

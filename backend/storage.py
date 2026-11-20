@@ -65,11 +65,26 @@ def serialize_session_markdown(session: dict[str, Any], clean_export: bool = Fal
             }
             if msg.get("metrics"):
                 turn_meta["metrics"] = msg["metrics"]
+            if msg.get("tool_events"):
+                turn_meta["tool_events"] = msg["tool_events"]
+            if msg.get("attached_files"):
+                turn_meta["attached_files"] = msg["attached_files"]
             block_lines.append(
                 f"<!-- CHATBOT_TURN:{json.dumps(turn_meta, ensure_ascii=False)} -->"
             )
 
         block_lines.append(heading)
+
+        if clean_export and role == "assistant" and msg.get("tool_events"):
+            block_lines.append("<details>")
+            block_lines.append(f"<summary>Agent Tool Calls ({len(msg['tool_events'])})</summary>")
+            block_lines.append("")
+            for te in msg["tool_events"]:
+                status_icon = "✅" if te.get("ok") else ("🚫" if te.get("approved") is False else "⚠️")
+                block_lines.append(f"- {status_icon} `{te.get('name')}` — {te.get('summary', '')}")
+            block_lines.append("")
+            block_lines.append("</details>")
+            block_lines.append("")
 
         if role == "assistant" and reasoning:
             if not clean_export:
@@ -131,6 +146,10 @@ def parse_session_markdown(markdown_text: str) -> dict[str, Any]:
         }
         if turn_meta.get("metrics"):
             msg["metrics"] = turn_meta["metrics"]
+        if turn_meta.get("tool_events"):
+            msg["tool_events"] = turn_meta["tool_events"]
+        if turn_meta.get("attached_files"):
+            msg["attached_files"] = turn_meta["attached_files"]
         messages.append(msg)
 
     return {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -10,49 +11,75 @@ import httpx
 
 from backend.config import DEFAULT_GEN_PARAMS, MLX_BASE_URL
 
-# Control/channel tokens emitted by gpt-oss-120b (Harmony format) & standard <think> models
-CONTROL_TOKENS: list[tuple[str, str | None]] = [
-    ("<|channel|>analysis<|message|>", "reasoning"),
-    ("<|channel|>commentary<|message|>", "reasoning"),
-    ("<|channel|>final<|message|>", "content"),
-    ("<|start|>assistant<|channel|>analysis<|message|>", "reasoning"),
-    ("<|start|>assistant<|channel|>commentary<|message|>", "reasoning"),
-    ("<|start|>assistant<|channel|>final<|message|>", "content"),
-    ("<|start|>assistant", "control"),
-    ("<|end|>", "control"),
-    ("<|return|>", "control"),
-    ("<|call|>", "control"),
-    ("<|start|>", "control"),
-    ("<|message|>", "control"),
-    ("<|channel|>", "control"),
-    ("<think>", "reasoning"),
-    ("</think>", "content"),
-]
+# Regex patterns for OpenAI Harmony channels, tool calls, and <think> tags
+TOOL_HEADER_A_RE = re.compile(
+    r"(?:<\|start\|>assistant)?\s*to=functions\.([a-zA-Z0-9_-]+)\s*<\|channel\|>(?:commentary|analysis)(?:\s*<\|constrain\|>)?(?:\s*[a-zA-Z0-9_+-]+)?\s*<\|message\|>"
+)
+TOOL_HEADER_B_RE = re.compile(
+    r"(?:<\|start\|>assistant)?\s*<\|channel\|>commentary\s+to=functions\.([a-zA-Z0-9_-]+)(?:\s*<\|constrain\|>)?(?:\s*[a-zA-Z0-9_+-]+)?\s*<\|message\|>"
+)
+REASONING_HEADER_RE = re.compile(
+    r"(?:<\|start\|>assistant)?\s*<\|channel\|>analysis\s*<\|message\|>|<think>"
+)
+FINAL_HEADER_RE = re.compile(
+    r"(?:<\|start\|>assistant)?\s*<\|channel\|>final\s*<\|message\|>|</think>"
+)
+CONTROL_END_RE = re.compile(r"<\|call\|>|<\|end\|>|<\|return\|>")
 
-# Precompute longest control token for tail buffering
-MAX_TAG_LEN = max(len(t[0]) for t in CONTROL_TOKENS)
-# Special prefixes that can start any control token
-TAG_START_MARKERS = ("<|", "<think", "</think")
+# Prefixes that might initiate any Harmony / think tag or tool header
+HOLD_START_RE = re.compile(r"(<\|?|<t|</t|\s*to=functions\.|\s*to=f|\s*to=)")
+PARTIAL_PREFIXES = (
+    "<|",
+    "<think>",
+    "</think>",
+    "to=functions.",
+    " to=functions.",
+)
+MAX_HEADER_HOLD = 140
+
+
+def _safe_parse_json_args(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+    except json.JSONDecodeError:
+        # Try extracting first JSON object if trailing garbage exists
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                parsed = json.loads(text[start : end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return {"_raw": text}
 
 
 class HarmonyStreamParser:
     """
-    Incremental streaming state machine that cleanly separates:
-      - OpenAI Harmony tags (`<|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>...`)
-      - Standard `<think>...</think>` tags
-      - Native OpenAI/mlx_lm `delta.reasoning` fields
-    even when tags are split across arbitrary token/SSE chunks.
+    Incremental streaming state machine for gpt-oss-120b (OpenAI Harmony) + <think> models:
+      - `analysis` channel / `<think>` -> ("reasoning", str)
+      - `final` channel / plain text -> ("content", str)
+      - `commentary` tool calls (`to=functions.<name>`) -> ("tool_call", {"name": str, "arguments": dict})
+    Handles arbitrary chunk boundaries (even 1 character at a time).
     """
 
     def __init__(self) -> None:
-        self.mode: str = "content"  # "reasoning" | "content" | "control"
+        self.mode: str = "content"  # "content" | "reasoning" | "tool" | "control"
         self.buffer: str = ""
-        self._saw_harmony: bool = False
+        self._tool_name: str | None = None
+        self._tool_args_buf: list[str] = []
 
     def feed(
         self, content_chunk: str | None = None, reasoning_chunk: str | None = None
-    ) -> list[tuple[str, str]]:
-        events: list[tuple[str, str]] = []
+    ) -> list[tuple[str, Any]]:
+        events: list[tuple[str, Any]] = []
         if reasoning_chunk:
             events.append(("reasoning", reasoning_chunk))
         if not content_chunk:
@@ -62,111 +89,169 @@ class HarmonyStreamParser:
         events.extend(self._drain(final=False))
         return events
 
-    def flush(self) -> list[tuple[str, str]]:
-        return self._drain(final=True)
+    def flush(self) -> list[tuple[str, Any]]:
+        events = self._drain(final=True)
+        if self.mode == "tool" and self._tool_name:
+            events.append(self._finalize_tool_call())
+        return events
 
-    def _find_next_tag(self, text: str) -> tuple[int, str, str | None] | None:
-        best_pos = -1
-        best_tok = ""
-        best_action: str | None = None
-        for tok, action in CONTROL_TOKENS:
-            pos = text.find(tok)
-            if pos != -1:
-                # Pick earliest match; on tie pick longest token
-                if best_pos == -1 or pos < best_pos or (
-                    pos == best_pos and len(tok) > len(best_tok)
-                ):
-                    best_pos = pos
-                    best_tok = tok
-                    best_action = action
-        if best_pos == -1:
-            return None
-        return best_pos, best_tok, best_action
+    def _finalize_tool_call(self) -> tuple[str, dict[str, Any]]:
+        name = self._tool_name or "unknown"
+        raw_args = "".join(self._tool_args_buf)
+        self._tool_name = None
+        self._tool_args_buf = []
+        self.mode = "control"
+        return ("tool_call", {"name": name, "arguments": _safe_parse_json_args(raw_args)})
 
-    def _safe_prefix_len(self, text: str) -> int:
-        """Return index up to which text is guaranteed not to contain the start of a partial tag."""
-        tail_start = max(0, len(text) - MAX_TAG_LEN)
-        tail = text[tail_start:]
-        # Check if any suffix of `tail` is a proper prefix of any known CONTROL_TOKEN
-        earliest_hold = len(text)
-        for i in range(len(tail)):
-            suffix = tail[i:]
-            if not suffix.startswith("<"):
-                continue
-            for tok, _ in CONTROL_TOKENS:
-                if tok.startswith(suffix):
-                    earliest_hold = min(earliest_hold, tail_start + i)
-                    break
-        return earliest_hold
-
-    def _emit(self, events: list[tuple[str, str]], chunk: str) -> None:
+    def _emit_text(self, events: list[tuple[str, Any]], chunk: str) -> None:
         if not chunk:
             return
         if self.mode == "reasoning":
             events.append(("reasoning", chunk))
         elif self.mode == "content":
             events.append(("content", chunk))
-        # In "control" mode (between <|end|> and next <|channel|>...<|message|>),
-        # ignore whitespace/stray channel header fragments unless plain text resumes.
+        elif self.mode == "tool":
+            self._tool_args_buf.append(chunk)
         elif self.mode == "control":
-            stripped = chunk.strip()
-            if stripped and stripped not in ("assistant", "analysis", "final", "commentary"):
+            # Drop control whitespace/stray role markers between <|end|> and next header
+            cleaned = chunk.strip()
+            if cleaned and cleaned not in ("assistant", "analysis", "final", "commentary"):
                 events.append(("content", chunk))
 
-    def _drain(self, final: bool) -> list[tuple[str, str]]:
-        events: list[tuple[str, str]] = []
+    def _find_earliest_match(self, text: str) -> tuple[int, int, str, str | None] | None:
+        candidates: list[tuple[int, int, str, str | None]] = []
+
+        for rx in (TOOL_HEADER_A_RE, TOOL_HEADER_B_RE):
+            m = rx.search(text)
+            if m:
+                candidates.append((m.start(), m.end(), "tool", m.group(1)))
+
+        m = REASONING_HEADER_RE.search(text)
+        if m:
+            candidates.append((m.start(), m.end(), "reasoning", None))
+
+        m = FINAL_HEADER_RE.search(text)
+        if m:
+            candidates.append((m.start(), m.end(), "content", None))
+
+        m = CONTROL_END_RE.search(text)
+        if m:
+            candidates.append((m.start(), m.end(), "end", m.group(0)))
+
+        if not candidates:
+            return None
+        # Earliest start position wins; on tie, longest span wins
+        candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+        return candidates[0]
+
+    def _compute_safe_emit_len(self, text: str) -> int:
+        """Hold back any tail that could be the beginning of an incomplete Harmony/tool/think tag."""
+        # 1) If `<|` or `to=functions.` already started in the buffer, hold from its start
+        #    (up to MAX_HEADER_HOLD chars so malformed plain text doesn't stall forever)
+        tail_window_start = max(0, len(text) - MAX_HEADER_HOLD)
+        window = text[tail_window_start:]
+
+        hold_idx = len(text)
+
+        for marker in ("<|", "<think", "</think", "to=functions."):
+            pos = window.find(marker)
+            if pos != -1:
+                hold_idx = min(hold_idx, tail_window_start + pos)
+
+        # Also check short trailing suffixes that could start any marker (e.g. `<`, ` to=f`, `to=`)
+        suffix_scan_start = max(0, len(text) - 16)
+        for i in range(suffix_scan_start, len(text)):
+            suf = text[i:]
+            for pref in PARTIAL_PREFIXES:
+                if pref.startswith(suf):
+                    hold_idx = min(hold_idx, i)
+                    break
+
+        return hold_idx
+
+    def _drain(self, final: bool) -> list[tuple[str, Any]]:
+        events: list[tuple[str, Any]] = []
         while self.buffer:
-            match = self._find_next_tag(self.buffer)
+            match = self._find_earliest_match(self.buffer)
             if match is not None:
-                pos, tok, action = match
-                if pos > 0:
-                    self._emit(events, self.buffer[:pos])
-                # Advance past matched token
-                self.buffer = self.buffer[pos + len(tok) :]
-                if tok.startswith("<|"):
-                    self._saw_harmony = True
-                if action == "reasoning":
+                start, end, kind, extra = match
+                if start > 0:
+                    self._emit_text(events, self.buffer[:start])
+                self.buffer = self.buffer[end:]
+
+                if kind == "tool":
+                    if self.mode == "tool" and self._tool_name:
+                        events.append(self._finalize_tool_call())
+                    self.mode = "tool"
+                    self._tool_name = extra
+                    self._tool_args_buf = []
+                elif kind == "reasoning":
+                    if self.mode == "tool" and self._tool_name:
+                        events.append(self._finalize_tool_call())
                     self.mode = "reasoning"
-                elif action == "content":
+                elif kind == "content":
+                    if self.mode == "tool" and self._tool_name:
+                        events.append(self._finalize_tool_call())
                     self.mode = "content"
-                elif action == "control":
-                    # Wait for next channel tag; if we matched `<|channel|>` alone, check
-                    # whether the remaining buffer might complete `<|channel|>final<|message|>`.
-                    if tok in ("<|channel|>", "<|start|>"):
-                        # Only consume bare <|channel|> / <|start|> when final or followed by unknown text
-                        if not final and len(self.buffer) < 30:
-                            # Put it back and wait for more tokens to form the full compound tag
-                            self.buffer = tok + self.buffer
-                            break
+                elif kind == "end":
+                    if self.mode == "tool" and self._tool_name:
+                        events.append(self._finalize_tool_call())
                     self.mode = "control"
                 continue
 
             if final:
-                self._emit(events, self.buffer)
+                self._emit_text(events, self.buffer)
                 self.buffer = ""
                 break
 
-            safe_len = self._safe_prefix_len(self.buffer)
+            safe_len = self._compute_safe_emit_len(self.buffer)
             if safe_len > 0:
-                self._emit(events, self.buffer[:safe_len])
+                self._emit_text(events, self.buffer[:safe_len])
                 self.buffer = self.buffer[safe_len:]
             break
 
         return events
 
 
+def build_agent_system_instructions(agent_mode: str, workspace_root: str) -> str:
+    if agent_mode == "off":
+        return ""
+    if agent_mode == "read_only":
+        return (
+            f"\n\n[로컬 워크스페이스 에이전트 - 읽기 전용]\n"
+            f"- 현재 활성 워크스페이스 경로: `{workspace_root}`\n"
+            f"- `list_dir`, `read_file`, `search_files` 도구를 사용해 실제 파일을 확인한 뒤 사실에 근거해 답변하세요.\n"
+            f"- 파일 수정이나 명령 실행은 현재 읽기 전용 모드라 비활성화되어 있습니다."
+        )
+    mode_note = (
+        "파일 생성·수정(`write_file`, `edit_file`) 및 터미널 명령(`run_command`)은 사용자 승인 후 실행됩니다."
+        if agent_mode == "approve"
+        else "파일 읽기·수정 및 안전한 명령을 자율적으로 실행할 수 있습니다."
+    )
+    return (
+        f"\n\n[로컬 워크스페이스 코딩 에이전트 (Antigravity 모드)]\n"
+        f"- 현재 활성 워크스페이스 경로: `{workspace_root}`\n"
+        f"- 사용 가능한 도구: `list_dir`, `read_file`, `search_files`, `write_file`, `edit_file`, `run_command`.\n"
+        f"- {mode_note}\n"
+        f"- 코드를 수정하기 전에는 반드시 `read_file`이나 `search_files`로 실제 파일을 확인하세요.\n"
+        f"- 수정 후에는 가능하면 테스트나 검증 명령을 실행해 결과를 확인하고, 한국어로 명확하게 요약하세요."
+    )
+
+
 def build_llm_messages(
     system_prompt: str,
     history_messages: list[dict[str, Any]],
-) -> list[dict[str, str]]:
+    extra_system: str = "",
+) -> list[dict[str, Any]]:
     """
     Build OpenAI messages[] payload.
     CRITICAL for gpt-oss-120b: only include final assistant `content` in multi-turn context,
     NEVER re-inject past internal reasoning/CoT tokens.
     """
-    messages: list[dict[str, str]] = []
-    if system_prompt.strip():
-        messages.append({"role": "system", "content": system_prompt.strip()})
+    messages: list[dict[str, Any]] = []
+    full_system = (system_prompt.strip() + extra_system).strip()
+    if full_system:
+        messages.append({"role": "system", "content": full_system})
 
     for msg in history_messages:
         role = msg.get("role")
@@ -178,14 +263,16 @@ def build_llm_messages(
 
 
 async def stream_chat_completion(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     params: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
     cancel_event: asyncio.Event | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
-    Stream chat completion from local mlx_lm.server, yielding structured events:
+    Stream one completion step from local mlx_lm.server, yielding structured events:
       - {"type": "reasoning", "text": "..."}
       - {"type": "content", "text": "..."}
+      - {"type": "tool_call", "name": "...", "arguments": {...}}
       - {"type": "keepalive", "detail": "..."}
       - {"type": "done", "metrics": {...}, "cancelled": bool}
     """
@@ -205,6 +292,11 @@ async def stream_chat_completion(
         "max_tokens": int(cfg["max_tokens"]),
         "chat_template_kwargs": {"reasoning_effort": reasoning_effort},
     }
+
+    if tools:
+        payload["tools"] = tools
+        # Stop cleanly at Harmony <|call|> so the model doesn't hallucinate tool output
+        payload["stop"] = ["<|call|>"]
 
     parser = HarmonyStreamParser()
     t_start = time.monotonic()
@@ -262,17 +354,33 @@ async def stream_chat_completion(
                 delta = choices[0].get("delta") or {}
                 content_piece = delta.get("content")
                 reasoning_piece = delta.get("reasoning") or delta.get("reasoning_content")
+                native_tool_calls = delta.get("tool_calls") or []
 
-                if content_piece or reasoning_piece:
+                if content_piece or reasoning_piece or native_tool_calls:
                     if t_first_token is None:
                         t_first_token = time.monotonic()
                     chunk_count += 1
 
-                for ev_type, text in parser.feed(content_piece, reasoning_piece):
-                    yield {"type": ev_type, "text": text}
+                for tc in native_tool_calls:
+                    fn = tc.get("function") or {}
+                    t_name = fn.get("name")
+                    t_args = fn.get("arguments", {})
+                    if isinstance(t_args, str):
+                        t_args = _safe_parse_json_args(t_args)
+                    if t_name:
+                        yield {"type": "tool_call", "name": t_name, "arguments": t_args}
 
-    for ev_type, text in parser.flush():
-        yield {"type": ev_type, "text": text}
+                for ev_type, val in parser.feed(content_piece, reasoning_piece):
+                    if ev_type == "tool_call":
+                        yield {"type": "tool_call", **val}
+                    else:
+                        yield {"type": ev_type, "text": val}
+
+    for ev_type, val in parser.flush():
+        if ev_type == "tool_call":
+            yield {"type": "tool_call", **val}
+        else:
+            yield {"type": ev_type, "text": val}
 
     elapsed = max(time.monotonic() - t_start, 0.001)
     ttft = round(t_first_token - t_start, 2) if t_first_token else round(elapsed, 2)
