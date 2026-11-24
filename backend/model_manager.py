@@ -192,7 +192,6 @@ class ModelManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
-                start_new_session=True,
             )
             self._log_task = asyncio.create_task(self._read_proc_output(self._proc))
             self._load_task = asyncio.create_task(self._wait_and_warmup(self._proc))
@@ -266,28 +265,18 @@ class ModelManager:
         if proc.returncode is not None:
             return
         try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGTERM)
+            proc.terminate()
         except ProcessLookupError:
             return
-        except Exception:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                return
 
         try:
             await asyncio.wait_for(proc.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             self._append_log("Process did not exit on SIGTERM; sending SIGKILL...")
             try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGKILL)
-            except Exception:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                proc.kill()
+            except ProcessLookupError:
+                pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
